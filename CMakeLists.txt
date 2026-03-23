@@ -48,4 +48,7 @@ ament_target_dependencies(kalman_filter_node rclcpp std_msgs geometry_msgs nav_m
 install(TARGETS kalman_filter_node
   DESTINATION lib/${PROJECT_NAME})
 
+install(DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME})
+
 ament_package()
