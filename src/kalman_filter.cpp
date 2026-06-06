@@ -1,5 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Matrix3x3.h>
@@ -7,6 +8,7 @@
 #include <Eigen/Dense>
 #include <cmath>
 #include <cstdlib>
+#include <deque>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -21,6 +23,7 @@ private:
     nav_msgs::msg::Odometry filtered_pose_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr filtered_pose_pub_;
     rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr natnet_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
     Eigen::MatrixXd F_est_;
@@ -37,6 +40,7 @@ private:
 
     std::string natnet_topic_ = "/natnet_ros/Bebop1/pose";
     std::string filtered_pose_topic_ = "/filtered_pose";
+    std::string command_topic_ = "/tello/cmd_vel";
     bool has_measurement_ = false;
     bool has_new_measurement_ = false;
     bool filter_initialized_ = false;
@@ -48,6 +52,27 @@ private:
     double timer_period_sec_ = 0.01;
     double sigma_a_ = 30.0;
     double measurement_var_ = 0.1;
+    bool publish_prediction_without_measurement_ = true;
+    double max_prediction_duration_sec_ = 2.0;
+    bool use_control_input_model_ = false;
+    double control_input_timeout_sec_ = 0.25;
+    double control_input_delay_sec_ = 0.0;
+    double control_model_max_step_sec_ = 0.02;
+    double gamma1_ = 3.75;
+    double gamma2_ = -1.10;
+    double gamma3_ = 3.75;
+    double gamma4_ = -1.10;
+    double gamma5_ = 2.68;
+    double gamma6_ = -0.75;
+    double gamma7_ = 1.42;
+    double gamma8_ = -2.06;
+
+    struct TimedCommand {
+        rclcpp::Time stamp;
+        geometry_msgs::msg::Twist cmd;
+    };
+    std::deque<TimedCommand> command_buffer_;
+    std::size_t command_buffer_max_size_ = 1000;
 
     rclcpp::Time resolveMeasurementTime(const geometry_msgs::msg::PoseStamped &msg) const {
         const auto &stamp = msg.header.stamp;
@@ -92,6 +117,91 @@ private:
         }
 
         Q_est_ = G_est_ * Eigen::MatrixXd::Identity(6, 6) * std::pow(sigma_a_, 2) * G_est_.transpose();
+    }
+
+    void cmdCallback(const geometry_msgs::msg::Twist::SharedPtr msg) {
+        TimedCommand timed_cmd;
+        timed_cmd.stamp = this->now();
+        timed_cmd.cmd = *msg;
+        command_buffer_.push_back(timed_cmd);
+        while (command_buffer_.size() > command_buffer_max_size_) {
+            command_buffer_.pop_front();
+        }
+    }
+
+    bool getCommandForPrediction(
+        const rclcpp::Time &target_time,
+        geometry_msgs::msg::Twist &cmd) const
+    {
+        if (!use_control_input_model_ || command_buffer_.empty()) {
+            return false;
+        }
+
+        const rclcpp::Time effective_time =
+            target_time - rclcpp::Duration::from_seconds(control_input_delay_sec_);
+
+        for (auto it = command_buffer_.rbegin(); it != command_buffer_.rend(); ++it) {
+            if (it->stamp <= effective_time) {
+                const double age = (effective_time - it->stamp).seconds();
+                if (std::isfinite(age) && age <= control_input_timeout_sec_) {
+                    cmd = it->cmd;
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        return false;
+    }
+
+    void predictStateWithControlModel(
+        double dt,
+        const geometry_msgs::msg::Twist &cmd)
+    {
+        if (!std::isfinite(dt) || dt <= 0.0) {
+            return;
+        }
+
+        const double max_step =
+            (std::isfinite(control_model_max_step_sec_) && control_model_max_step_sec_ > 0.0)
+                ? control_model_max_step_sec_
+                : timer_period_sec_;
+        const int steps = std::max(1, static_cast<int>(std::ceil(dt / max_step)));
+        const double h = dt / static_cast<double>(steps);
+
+        for (int step = 0; step < steps; ++step) {
+            const double yaw = x_est_(10);
+            const double c = std::cos(yaw);
+            const double s = std::sin(yaw);
+
+            const double vx_world = x_est_(1);
+            const double vy_world = x_est_(5);
+            const double vz = x_est_(9);
+            const double vyaw = x_est_(11);
+
+            const double vx_body = c * vx_world + s * vy_world;
+            const double vy_body = -s * vx_world + c * vy_world;
+
+            const double ax_body = gamma2_ * vx_body + gamma1_ * cmd.linear.x;
+            const double ay_body = gamma4_ * vy_body + gamma3_ * cmd.linear.y;
+            const double ax_world = c * ax_body - s * ay_body;
+            const double ay_world = s * ax_body + c * ay_body;
+            const double az = gamma6_ * vz + gamma5_ * cmd.linear.z;
+            const double ayaw = gamma8_ * vyaw + gamma7_ * cmd.angular.z;
+
+            x_est_(0) += vx_world * h + 0.5 * ax_world * h * h;
+            x_est_(1) += ax_world * h;
+            x_est_(4) += vy_world * h + 0.5 * ay_world * h * h;
+            x_est_(5) += ay_world * h;
+            x_est_(8) += vz * h + 0.5 * az * h * h;
+            x_est_(9) += az * h;
+            x_est_(10) += vyaw * h + 0.5 * ayaw * h * h;
+            x_est_(11) += ayaw * h;
+
+            // Roll and pitch are not commanded by this model; keep their constant-velocity prediction.
+            x_est_(2) += x_est_(3) * h;
+            x_est_(6) += x_est_(7) * h;
+        }
     }
 
     void initializeStateFromMeasurement() {
@@ -163,7 +273,12 @@ private:
         }
 
         updateDiscreteModel(predict_dt);
-        x_est_ = F_est_ * x_est_;
+        geometry_msgs::msg::Twist cmd;
+        if (getCommandForPrediction(target_time, cmd)) {
+            predictStateWithControlModel(predict_dt, cmd);
+        } else {
+            x_est_ = F_est_ * x_est_;
+        }
         P_est_ = F_est_ * P_est_ * F_est_.transpose() + Q_est_;
         last_predict_time_ = target_time;
     }
@@ -237,19 +352,34 @@ private:
         const rclcpp::Time now = this->now();
         const double elapsed = (now - last_measurement_arrival_time_).seconds();
         if (elapsed > measurement_timeout_sec_) {
+            if (!publish_prediction_without_measurement_ || elapsed > max_prediction_duration_sec_) {
+                RCLCPP_WARN_THROTTLE(
+                    this->get_logger(),
+                    *this->get_clock(),
+                    2000,
+                    "No pose measurement for %.3fs (timeout %.3fs, max prediction %.3fs). Skipping filtered_pose publish.",
+                    elapsed,
+                    measurement_timeout_sec_,
+                    max_prediction_duration_sec_);
+                return;
+            }
+
             RCLCPP_WARN_THROTTLE(
                 this->get_logger(),
                 *this->get_clock(),
                 2000,
-                "No pose measurement for %.3fs (timeout %.3fs). Skipping filtered_pose publish.",
+                "No pose measurement for %.3fs (timeout %.3fs). Publishing predicted filtered_pose.",
                 elapsed,
                 measurement_timeout_sec_);
-            return;
         }
 
         if (has_new_measurement_) {
             predictTo(last_measurement_time_);
             updateWithLatestMeasurement();
+        }
+
+        if (publish_prediction_without_measurement_) {
+            predictTo(now);
         }
 
         publishFilteredPose(now);
@@ -261,10 +391,49 @@ public:
         this->declare_parameter<double>("timer_period_sec", timer_period_sec_);
         this->declare_parameter<double>("sigma_a", sigma_a_);
         this->declare_parameter<double>("measurement_var", measurement_var_);
+        this->declare_parameter<bool>("publish_prediction_without_measurement", publish_prediction_without_measurement_);
+        this->declare_parameter<double>("max_prediction_duration_sec", max_prediction_duration_sec_);
+        this->declare_parameter<std::string>("command_topic", command_topic_);
+        this->declare_parameter<bool>("use_control_input_model", use_control_input_model_);
+        this->declare_parameter<double>("control_input_timeout_sec", control_input_timeout_sec_);
+        this->declare_parameter<double>("control_input_delay_sec", control_input_delay_sec_);
+        this->declare_parameter<double>("control_model_max_step_sec", control_model_max_step_sec_);
+        this->declare_parameter<double>("control_model_gamma1", gamma1_);
+        this->declare_parameter<double>("control_model_gamma2", gamma2_);
+        this->declare_parameter<double>("control_model_gamma3", gamma3_);
+        this->declare_parameter<double>("control_model_gamma4", gamma4_);
+        this->declare_parameter<double>("control_model_gamma5", gamma5_);
+        this->declare_parameter<double>("control_model_gamma6", gamma6_);
+        this->declare_parameter<double>("control_model_gamma7", gamma7_);
+        this->declare_parameter<double>("control_model_gamma8", gamma8_);
         this->get_parameter("measurement_timeout_sec", measurement_timeout_sec_);
         this->get_parameter("timer_period_sec", timer_period_sec_);
         this->get_parameter("sigma_a", sigma_a_);
         this->get_parameter("measurement_var", measurement_var_);
+        this->get_parameter("publish_prediction_without_measurement", publish_prediction_without_measurement_);
+        this->get_parameter("max_prediction_duration_sec", max_prediction_duration_sec_);
+        this->get_parameter("command_topic", command_topic_);
+        this->get_parameter("use_control_input_model", use_control_input_model_);
+        this->get_parameter("control_input_timeout_sec", control_input_timeout_sec_);
+        this->get_parameter("control_input_delay_sec", control_input_delay_sec_);
+        this->get_parameter("control_model_max_step_sec", control_model_max_step_sec_);
+        this->get_parameter("control_model_gamma1", gamma1_);
+        this->get_parameter("control_model_gamma2", gamma2_);
+        this->get_parameter("control_model_gamma3", gamma3_);
+        this->get_parameter("control_model_gamma4", gamma4_);
+        this->get_parameter("control_model_gamma5", gamma5_);
+        this->get_parameter("control_model_gamma6", gamma6_);
+        this->get_parameter("control_model_gamma7", gamma7_);
+        this->get_parameter("control_model_gamma8", gamma8_);
+
+        if (max_prediction_duration_sec_ < measurement_timeout_sec_) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "max_prediction_duration_sec %.3f is smaller than measurement_timeout_sec %.3f. Clamping max_prediction_duration_sec to measurement_timeout_sec.",
+                max_prediction_duration_sec_,
+                measurement_timeout_sec_);
+            max_prediction_duration_sec_ = measurement_timeout_sec_;
+        }
 
         initializeFilterMatrices();
         last_predict_time_ = this->now();
@@ -303,6 +472,10 @@ public:
             natnet_topic_,
             10,
             std::bind(&SimpleKalmanFilter::natnetCallback, this, std::placeholders::_1));
+        cmd_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+            command_topic_,
+            10,
+            std::bind(&SimpleKalmanFilter::cmdCallback, this, std::placeholders::_1));
 
         timer_ = this->create_wall_timer(
             std::chrono::duration<double>(timer_period_sec_),
@@ -310,11 +483,15 @@ public:
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Simple Kalman initialized with timer_period_sec = %.3f, measurement_timeout_sec = %.3f, sigma_a = %.3f, measurement_var = %.3f",
+            "Simple Kalman initialized with timer_period_sec = %.3f, measurement_timeout_sec = %.3f, sigma_a = %.3f, measurement_var = %.3f, publish_prediction_without_measurement = %s, max_prediction_duration_sec = %.3f, use_control_input_model = %s, command_topic = %s",
             timer_period_sec_,
             measurement_timeout_sec_,
             sigma_a_,
-            measurement_var_);
+            measurement_var_,
+            publish_prediction_without_measurement_ ? "true" : "false",
+            max_prediction_duration_sec_,
+            use_control_input_model_ ? "true" : "false",
+            command_topic_.c_str());
     }
 };
 
